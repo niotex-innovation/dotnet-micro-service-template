@@ -1,0 +1,6 @@
+@AutoFit.Adp_HostAddress = http://localhost:5019
+
+GET {{AutoFit.Adp_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

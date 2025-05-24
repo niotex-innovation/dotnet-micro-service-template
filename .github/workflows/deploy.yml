@@ -1,0 +1,119 @@
+# 🔐 Reminder:
+# Make sure to add the secret `EC2_PASSWORD` in your repository settings:
+# GitHub → Repository → Settings → Secrets and variables → Actions → New repository secret → EC2_PASSWORD
+
+name: Deploy API to EC2 via WinRM
+
+on:
+  push:
+    branches:
+      - main  # Adjust branch if needed
+
+env:
+  APP_NAME: nxsuite-api-signup #IIS app name
+  DEPLOY_PATH: D:\nxsuite-api\signup #deployment path on EC2
+  EC2_SERVER: ec2-3-136-203-12.us-east-2.compute.amazonaws.com
+  EC2_USERNAME: Administrator
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'  # Adjust based on your .NET version
+
+      - name: Set build version
+        id: set_version
+        run: |
+          TZ='America/Chicago' date +'%Y.%m.%d.%H%M' > version.txt
+          echo "VERSION=$(cat version.txt)" >> $GITHUB_ENV
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build project
+        run: dotnet publish -c Release -o ./publish -p:Version=${{ env.VERSION }}
+
+      - name: Zip only the contents inside "publish" folder
+        run: |
+          cd publish
+          zip -r ../${{ env.APP_NAME }}.zip ./*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+          path: ./${{ env.APP_NAME }}.zip
+
+  deploy:
+    runs-on: windows-latest
+    needs: build
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+          path: .
+
+      - name: Test WinRM Connection to EC2
+        run: |
+          $secPassword = ConvertTo-SecureString '${{ secrets.EC2_PASSWORD }}' -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($env:EC2_USERNAME, $secPassword)
+
+          Set-Item WSMan:\localhost\Client\TrustedHosts -Value $env:EC2_SERVER -Force
+
+          Invoke-Command -ComputerName $env:EC2_SERVER -Credential $credential -Port 5985 -ScriptBlock { hostname }
+        shell: pwsh
+
+      - name: Deploy Application to EC2 via WinRM
+        run: |
+          $secPassword = ConvertTo-SecureString '${{ secrets.EC2_PASSWORD }}' -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($env:EC2_USERNAME, $secPassword)
+          
+          $localZipPath = "$PWD/$env:APP_NAME.zip"
+          $remoteZipPath = "D:\temp\$env:APP_NAME.zip"
+          $deployPath = $env:DEPLOY_PATH
+          
+          Invoke-Command -ComputerName $env:EC2_SERVER -Credential $credential -Port 5985 -ScriptBlock {
+            if (!(Test-Path "D:\temp")) { New-Item -Path "D:\temp" -ItemType Directory }
+          }
+          
+          Copy-Item -Path $localZipPath -Destination $remoteZipPath -ToSession (New-PSSession -ComputerName $env:EC2_SERVER -Credential $credential -Port 5985)
+          
+          Invoke-Command -ComputerName $env:EC2_SERVER -Credential $credential -Port 5985 -ScriptBlock {
+            param($zipPath, $deployPath, $appPool)
+          
+            try {
+              Stop-WebAppPool -Name $appPool -ErrorAction Stop
+            } catch {
+              if ($_.Exception.Message -notmatch "already stopped") {
+                Stop-WebAppPool -Name $appPool -ErrorAction Stop
+              } else {
+                Write-Host "App pool '$appPool' is already stopped. Continuing..."
+              }
+            }
+          
+            Remove-Item -Recurse -Force "$deployPath\*" -ErrorAction SilentlyContinue
+          
+            while (Test-Path $deployPath) {
+              try {
+                Get-ChildItem -Path $deployPath -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction Stop
+                break
+              } catch {
+                Write-Host "Attempt to remove files failed. Waiting 10 seconds and retrying..."
+                Start-Sleep -Seconds 10
+              }
+            }
+          
+            Expand-Archive -Path $zipPath -DestinationPath $deployPath -Force
+          
+            Start-WebAppPool -Name $appPool
+          } -ArgumentList $remoteZipPath, $deployPath, $env:APP_NAME
+        shell: pwsh
